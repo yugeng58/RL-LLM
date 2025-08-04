@@ -1,201 +1,298 @@
+import math
 from llama_cpp import Llama
+import re
 import numpy as np
+import random
 
+class MCTS_NODE:
+    def __init__(self, parent, solution, critique, Q_value):
+        self.parent = parent
+        self.solution = solution
+        self.critique = critique
+        self.Q_value = Q_value
+        self.visit_count = 0
+        self.children = []  
+        self.reward_samples = [] 
+        self.fully_expanded = False 
+        self.expanded_children = 0 
+    
 class MCTS_REASONING_LLM:
-    class MCTS_NODE:
-        def __init__(self, parent, actions_and_probs, k):
-            self.parent = parent
-            self.last_visit = -1
-            self.end = False
-            (self.actions, self.probs) = actions_and_probs
-            self.actions = np.array(self.actions)
-            self.probs = np.array(self.probs)
-            self.child = np.full((k,), -1)
-            self.mean_reward = np.full((k,), 0)
-            self.visit_count = 0
-            self.child_visit_count = np.full((k,), 0)
-
-        def get_optimum_child(self, policy_weight, explore_weight):
-            score = self.mean_reward + self.probs * policy_weight + \
-                    (np.sqrt(np.log(self.visit_count + 1e-6)) / (self.child_visit_count + 1e-6)) * explore_weight
-            return np.argmax(score)
-
-    def __init__(self, model_path, k, policy_weight=1, explore_weight=1):
-        self.model = Llama(model_path, n_ctx=16384, n_gpu_layers=99, logits_all=True, verbose=False)
-        self.clean()
+    def __init__(self, model_path, max_child=5, c=1):
+        self.model = Llama(model_path, n_ctx=16384, n_gpu_layers=99, logits_all=False, verbose=False)
+        self.max_child = max_child
+        self.c = c
         self.nodes = []
-        self.policy_weight = policy_weight
-        self.explore_weight = explore_weight
-        self.k = k
+        self.query = None
+        self.dummy_answers = [
+            "I Don't Know",
+            "I can't understand this question.",
+            "I can't help with this question.",
+            "I don't know how to solve this question.",
+            "I don't know the answer to this question.",
+            "I don't know the answer to this question, sorry."
+        ]
 
-    def push_back(self, role, content):
-        self.stream += f" <|start_header_id|>{role}<|end_header_id|>" \
-                       f"{content}" \
-                       "<|eot_id|>"
+    def is_fully_expanded(self, idx): 
+        if len(self.nodes[idx].children) >= self.max_child:
+            return True
+        for child_idx in self.nodes[idx].children:
+            if self.nodes[child_idx].Q_value > self.nodes[idx].Q_value:
+                return True
+        return False
 
-    def clean(self):
-        self.stream = ""
-        self.push_back("system", "You are a helpful assistant. Always think step-by-step before answering and format your response as follows:\n"
-                                 "<step 1 content>\n"
-                                 "<step 2 content>\n"
-                                 "...\n"
-                                 "[answer]\n"
-                                 "<answer content>\n"
-                                 "Ensure every response follows this format, with each reasoning step on a new line and the answer preceded by [answer] on a new line, followed by its content on the next line.")
+    def get_optimum_child(self, idx):
+        if not self.nodes[idx].children: 
+            return -1
+        if self.nodes[idx].parent != -1:
+            parent_visit_count = self.nodes[self.nodes[idx].parent].visit_count
+        else:
+            parent_visit_count = 1
+        UCT = []
+        for child_idx in self.nodes[idx].children:
+            child_visit_count = self.nodes[child_idx].visit_count
+            uct_value = (self.nodes[child_idx].Q_value + 
+                        self.c * math.sqrt(math.log(parent_visit_count + 1) / (child_visit_count + 1e-6)))
+            UCT.append(uct_value)
+        
+        if (not self.nodes[idx].fully_expanded and 
+            np.max(UCT) < self.c * math.sqrt(math.log(parent_visit_count + 1) / 1e-6)):
+            return -1
+            
+        return self.nodes[idx].children[np.argmax(UCT)]
 
-    def generate_action_list(self, prompt):
-        output = self.model(prompt=prompt, max_tokens=1, logprobs=self.k, temperature=0)
-        output = output["choices"][0]["logprobs"]["top_logprobs"][0]
-        first_tokens = list(output.keys())
-        probs = list(output.values())
-        actions = []
-        for token in first_tokens:
-            continuation = self.model(prompt=prompt + token, max_tokens=256,
-                                      logprobs=0, temperature=0, stop='\n')["choices"][0]["text"]
-            actions.append(token + continuation + "\n")
-        return (actions, probs)
+    def generate_critique(self, query, solution):
+        print(f"[generate_critique] Generating critique for solution...")
+        
+        prompt = f"""<|start_header_id|>user<|end_header_id|>Since we have a weak Answer, could you provide me with a reflection or feedback to correct this answer better? Analyze this Answer Strictly and Critically, point out every flaw for every possible imperfect to minus every possible score!
 
-    def generate_answer_list(self, prompt):
-        output = self.model(prompt=prompt, max_tokens=1, logprobs=self.k, temperature=0)
-        output = output["choices"][0]["logprobs"]["top_logprobs"][0]
-        first_tokens = list(output.keys())
-        probs = list(output.values())
-        actions = []
-        for token in first_tokens:
-            continuation = self.model(prompt=prompt + token, max_tokens=512,
-                                      logprobs=0, temperature=0)["choices"][0]["text"]
-            actions.append(token + continuation)
-        return (actions, probs)
+Question: {query}
+Answer: {solution}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Let's think step by step."""
 
-    def answer_evaluate(self, query_answer):
-        # 简单占位符评估：始终返回 1.0
-        return 1.0
+        try:
+            response = self.model(prompt=prompt, max_tokens=1024, temperature=0.8)
+            critique = response["choices"][0]["text"].strip()
+            print(f"[generate_critique] Critique generated successfully: {critique}...")
+            return critique
+        except Exception as e:
+            print(f"[generate_critique] ERROR: {str(e)}")
+            return "The answer needs improvement."
 
-    def MCTS_initialize(self):
+    def generate_refined_solution(self, query, original_solution, critique):
+        print(f"[generate_refined_solution] Refining solution...")
+        
+        prompt = f"""<|start_header_id|>user<|end_header_id|>Please refine your answer according to the Reflection or Feedback. The response should begin with [reasoning process]...[Verification]... and end with "[Final Answer] The answer is [answer formula]"
+
+Question: {query}
+Original Answer: {original_solution}
+Feedback: {critique}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Let's think step by step."""
+
+        try:
+            response = self.model(prompt=prompt, max_tokens=2048, temperature=0.8)
+            refined = response["choices"][0]["text"].strip()
+            print(f"[generate_refined_solution] Refined solution generated successfully: {refined}...")
+            return refined
+        except Exception as e:
+            print(f"[generate_refined_solution] ERROR: {str(e)}")
+            return original_solution
+
+    def extract_score_from_text(self, text):
+        # Look for patterns like [Score] -50, [Score]: -50, Score: -50, etc.
+        score_patterns = [
+            r'\[Score\]\s*[-]?\d+',  # [Score] -50
+            r'\[Score\]:\s*[-]?\d+',  # [Score]: -50
+            r'Score:\s*[-]?\d+',     # Score: -50
+            r'Score\s+[-]?\d+',      # Score -50
+            r'score\s*[:=]\s*[-]?\d+',  # score: -50 or score = -50
+        ]
+        
+        for pattern in score_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                # Extract just the number from the match
+                number_match = re.search(r'[-]?\d+', match.group())
+                if number_match:
+                    return int(number_match.group())
+        
+        # Fallback: look for the last number in the text (often the final score)
+        all_numbers = re.findall(r'[-]?\d+', text)
+        if all_numbers:
+            # Filter numbers to reasonable score range
+            valid_scores = [int(num) for num in all_numbers if -100 <= int(num) <= 100]
+            if valid_scores:
+                return valid_scores[-1]  # Take the last valid score
+        
+        return 0  # Default if no score found
+
+    def self_evaluate(self, query, solution, num_samples=3):
+        print(f"[self_evaluate] Evaluating solution with {num_samples} samples...")
+        
+        scores = []
+        for i in range(num_samples):
+            prompt = f"""<|start_header_id|>user<|end_header_id|>Question: {query}
+Answer: {solution}
+
+Analyze this Answer Strictly and Critically, and point out every flaw for every possible imperfect to minus every possible score! You need to be very harsh and mean in calculating grades, and never give full marks to ensure that the marks are authoritative.
+
+Output a score between [-100,+100].
+
+Format: [Analysis] your analysis here [Score] your_number_here
+
+Example: [Analysis] The solution has calculation errors and lacks proper reasoning. [Score] -45<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>"""
+
+            try:
+                response = self.model(prompt=prompt, max_tokens=512, temperature=0.8)
+                text = response["choices"][0]["text"]
+                print(f"[self_evaluate] Sample {i+1} response: {text}...")
+                
+                # Extract score using improved method
+                score = self.extract_score_from_text(text)
+                
+                # Full Score Suppression: reduce scores above 95
+                if score > 95:
+                    score = max(95, score - 10)
+                
+                # Clamp score to valid range
+                score = max(-100, min(100, score))
+                scores.append(score)
+                print(f"[self_evaluate] Sample {i+1} extracted score: {score}")
+                    
+            except Exception as e:
+                print(f"[self_evaluate] ERROR in sample {i+1}: {str(e)}")
+                scores.append(0)
+        
+        print(f"[self_evaluate] Final scores: {scores}")
+        return scores
+    
+    def calculate_q_value(self, reward_samples):
+        """Calculate Q value using formula from paper: Q(a) = 1/2 * (min(R_a) + mean(R_a))"""
+        if not reward_samples:
+            return 0
+        
+        min_reward = min(reward_samples)
+        mean_reward = sum(reward_samples) / len(reward_samples)
+        q_value = 0.5 * (min_reward + mean_reward)
+        
+        return q_value
+    
+    def update_q_value_with_children(self, node_index):
+        """Update Q value considering children: Q'(a) = 1/2 * (Q(a) + max_child_Q)"""
+        node = self.nodes[node_index]
+        
+        # Calculate base Q value from own rewards
+        base_q = self.calculate_q_value(node.reward_samples)
+        
+        # Find maximum Q value among children
+        max_child_q = float('-inf')
+        has_children = False
+        
+        for child_idx in node.children:
+            child_q = self.nodes[child_idx].Q_value
+            max_child_q = max(max_child_q, child_q)
+            has_children = True
+        
+        # Update Q value: Q'(a) = 1/2 * (Q(a) + max_child_Q)
+        if has_children:
+            node.Q_value = 0.5 * (base_q + max_child_q)
+        else:
+            node.Q_value = base_q
+
+    def mcts_init(self, query):
+        print(f"[mcts_init] Initializing MCTS for query: {query[:50]}...")
+        
+        self.query = query
         self.nodes = []
-        self.deleted = []
-        actions_and_probs = self.generate_action_list(self.stream)
-        root_node = self.MCTS_NODE(-1, actions_and_probs, self.k)
+        
+        # Create root node with dummy answer
+        dummy_solution = random.choice(self.dummy_answers)
+        critique = self.generate_critique(self.query, dummy_solution)
+        
+        # Create root node
+        root_node = MCTS_NODE(-1, dummy_solution, critique, 0)
+        
+        # Evaluate root node
+        root_node.reward_samples = self.self_evaluate(query, dummy_solution)
+        root_node.Q_value = self.calculate_q_value(root_node.reward_samples)
+        root_node.visit_count = 1
+        
         self.nodes.append(root_node)
-        self.set_root(0)
+        print(f"[mcts_init] Root node created with Q-value: {root_node.Q_value}")
 
-    def new_node(self, parent, actions_and_probs):
-        new_node = self.MCTS_NODE(parent, actions_and_probs, self.k)
-        if len(self.deleted):
-            idx = self.deleted[0]
-            self.nodes[idx] = new_node
-            self.deleted = self.deleted[1:]
-            return idx
-        else:
-            self.nodes.append(new_node)
-            return len(self.nodes) - 1
-
-    def delete_node(self, idx):
-        self.deleted.append(idx)
-
-    def delete_tree(self, idx):
-        for child in self.nodes[idx].child:
-            if child != -1:
-                self.delete_tree(child)
-        self.deleted.append(idx)
-
-    def set_root(self, idx):
-        self.root = idx
-        self.nodes[idx].parent = -1
-
-    def select_and_expand(self):
+    def iterator(self):
+        """Single MCTS iteration combining all phases: Selection -> Expansion -> Evaluation -> Backpropagation"""
+        # SELECTION PHASE: Navigate to leaf node
+        current_node = 0
         previous_node = -1
-        current_node = self.root
-        last_visit = -1
-        current_prompt = self.stream
-        while current_node != -1 and not self.nodes[current_node].end:
-            last_visit = self.nodes[current_node].get_optimum_child(self.policy_weight, self.explore_weight)
-            self.nodes[current_node].last_visit = last_visit
-            current_prompt += self.nodes[current_node].actions[last_visit]
-            previous_node = current_node
-            current_node = self.nodes[current_node].child[last_visit]
-
-        if current_node != -1:
-            return current_node, current_prompt
-        else:
-            if self.nodes[previous_node].actions[last_visit] == "[answer]\n":
-                actions, probs = self.generate_answer_list(current_prompt)
-                new_node_idx = self.new_node(previous_node, (actions, probs))
-                self.nodes[previous_node].child[last_visit] = new_node_idx
-                current_node = new_node_idx
-                self.nodes[current_node].end = True
-                for i in range(len(actions)):
-                    self.nodes[current_node].mean_reward[i] = self.answer_evaluate(current_prompt + actions[i] + '<|eot_id|>')
-            else:
-                actions, probs = self.generate_action_list(current_prompt)
-                new_node_idx = self.new_node(previous_node, (actions, probs))
-                self.nodes[previous_node].child[last_visit] = new_node_idx
-                current_node = new_node_idx
-            return current_node, current_prompt
-
-    def simulation(self, current_node, current_prompt):
-        if self.nodes[current_node].end:
-            optimum_child = self.nodes[current_node].get_optimum_child(self.policy_weight, self.explore_weight)
-            self.nodes[current_node].last_visit = optimum_child
-            reward = self.nodes[current_node].mean_reward[optimum_child]
-            return reward
-        else:
-            optimum_child = self.nodes[current_node].get_optimum_child(self.policy_weight, self.explore_weight)
-            self.nodes[current_node].last_visit = optimum_child
-            next_prompt = current_prompt + self.nodes[current_node].actions[optimum_child]
-            if self.nodes[current_node].child[optimum_child] == -1:
-                if self.nodes[current_node].actions[optimum_child] == "[answer]\n":
-                    actions, probs = self.generate_answer_list(next_prompt)
-                    new_node_idx = self.new_node(current_node, (actions, probs))
-                    self.nodes[current_node].child[optimum_child] = new_node_idx
-                    child_node = new_node_idx
-                    self.nodes[child_node].end = True
-                    for i in range(len(actions)):
-                        self.nodes[child_node].mean_reward[i] = self.answer_evaluate(next_prompt + actions[i] + '<|eot_id|>')
-                else:
-                    actions, probs = self.generate_action_list(next_prompt)
-                    new_node_idx = self.new_node(current_node, (actions, probs))
-                    self.nodes[current_node].child[optimum_child] = new_node_idx
-                    child_node = new_node_idx
-            else:
-                child_node = self.nodes[current_node].child[optimum_child]
-            return self.simulation(child_node, next_prompt)
-
-    def backpropagation(self, current_node, reward):
         while current_node != -1:
-            self.nodes[current_node].visit_count += 1
-            last_visit = self.nodes[current_node].last_visit
-            if last_visit != -1:
-                self.nodes[current_node].child_visit_count[last_visit] += 1
-                n = self.nodes[current_node].child_visit_count[last_visit]
-                self.nodes[current_node].mean_reward[last_visit] += (reward - self.nodes[current_node].mean_reward[last_visit]) / n
-            current_node = self.nodes[current_node].parent
+            previous_node = current_node
+            current_node = self.get_optimum_child(current_node)
+        
+        # EXPANSION PHASE: Create refined solution
+        solution = self.generate_refined_solution(
+            self.query, 
+            self.nodes[previous_node].solution, 
+            self.nodes[previous_node].critique 
+        )
+        critique = self.generate_critique(self.query, solution)
+        
+        # Create new child node
+        new_node = MCTS_NODE(previous_node, solution, critique, 0)
+        self.nodes.append(new_node)
+        current_node = len(self.nodes) - 1
+        
+        # Add child to parent's children list
+        self.nodes[previous_node].children.append(current_node)
+        
+        # EVALUATION PHASE: Self-evaluate the new solution
+        self.nodes[current_node].reward_samples = self.self_evaluate(self.query, solution)
+        self.nodes[current_node].Q_value = self.calculate_q_value(self.nodes[current_node].reward_samples)
+        self.nodes[current_node].visit_count = 1
+        
+        # BACKPROPAGATION PHASE: Update Q values up the tree
+        while previous_node != -1:
+            self.nodes[previous_node].visit_count += 1
+            self.update_q_value_with_children(previous_node)
+            self.nodes[previous_node].fully_expanded = self.is_fully_expanded(previous_node)  # Fixed: was 'fully_expended'
+            previous_node = self.nodes[previous_node].parent
 
-    def query(self, query, iterations=100):
-        self.push_back("user", query)
-        self.stream += "<|start_header_id|>assistant<|end_header_id|>"
-        self.MCTS_initialize()
-        while not self.nodes[self.root].end:
-            while self.nodes[self.root].visit_count < iterations:
-                current_node, current_prompt = self.select_and_expand()
-                reward = self.simulation(current_node, current_prompt)
-                self.backpropagation(current_node, reward)
-            optimum_child = self.nodes[self.root].get_optimum_child(self.policy_weight, self.explore_weight)
-            self.stream += self.nodes[self.root].actions[optimum_child]
-            for i in range(self.k):
-                if i != optimum_child and self.nodes[self.root].child[i] != -1:
-                    self.delete_tree(self.nodes[self.root].child[i])
-            new_root = self.nodes[self.root].child[optimum_child]
-            self.delete_node(self.root)
-            self.set_root(new_root)
-        optimum_child = self.nodes[self.root].get_optimum_child(self.policy_weight, self.explore_weight)
-        respond = self.nodes[self.root].actions[optimum_child]
-        self.stream += respond + '<|eot_id|>'
-        return respond
+    def run(self, query, iterations=100):
+        """Run MCTS for specified number of iterations"""
+        print(f"[run] Starting MCTS with {iterations} iterations...")
+        self.mcts_init(query)
+        for i in range(iterations):
+            print(f"[run] Iteration {i+1}/{iterations}")
+            self.iterator()
+            
+            # Print progress
+            if (i + 1) % 10 == 0:
+                best_node = max(self.nodes, key=lambda n: n.Q_value)
+                print(f"[run] Best Q-value after {i+1} iterations: {best_node.Q_value}")
+        
+        # Return best solution
+        best_node = max(self.nodes, key=lambda n: n.Q_value)
+        print(f"[run] Final best Q-value: {best_node.Q_value}")
+        return best_node.solution
 
+    def get_best_solution(self):
+        """Get the solution with highest Q-value"""
+        if not self.nodes:
+            return None
+        
+        best_node = max(self.nodes, key=lambda n: n.Q_value)
+        return best_node.solution
+    
 
-model_path = "llama-3.2-1b-instruct-q4_k_m.gguf"
-mcts_llm = MCTS_REASONING_LLM(model_path, k=3, policy_weight=1, explore_weight=1)
-query = "What is the capital of France?"
-response = mcts_llm.query(query, iterations=100)
-print("Response:", response)
+# Initialize the model
+mctsr = MCTS_REASONING_LLM("llama-3.1-8b-instruct-q4_k_m.gguf")
+
+# Solve a problem
+query = "What is the sum of the first 10 prime numbers?"
+solution = mctsr.run(query, 20)
+
+# Get tree statistics
+final_answer = mctsr.get_best_solution()
+print(f"Final answer: {final_answer}")
